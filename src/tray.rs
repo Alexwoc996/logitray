@@ -930,8 +930,9 @@ const RAZER_POLL_SECS: u64 = 120;
 /// icon, and low-battery notifier all treat it like any other device.
 fn spawn_razer_worker(proxy: EventLoopProxy<UserEvent>, cmd_rx: mpsc::Receiver<WorkerCommand>) {
     thread::spawn(move || {
-        let key = format!("{:04X}:kbd", crate::hid::razer::RAZER_DONGLE_PID);
-        let mut present = false;
+        // The device key depends on which dongle answers, so derive it from
+        // each successful poll instead of hardcoding a PID.
+        let mut last_key: Option<String> = None;
         loop {
             // Poll first: the very first iteration runs immediately, so the
             // keyboard shows up right after startup instead of one full
@@ -946,15 +947,14 @@ fn spawn_razer_worker(proxy: EventLoopProxy<UserEvent>, cmd_rx: mpsc::Receiver<W
             };
             match crate::hid::razer::poll_once(&api) {
                 Some(state) => {
+                    last_key = Some(state.device_key.clone());
                     let _ = proxy.send_event(UserEvent::Device(DeviceEvent::Update(state)));
-                    present = true;
                 }
                 None => {
                     // Dongle unplugged or keyboard asleep/asleep-fail. Only emit
                     // Gone once per disappearance so the menu doesn't flicker.
-                    if present {
-                        let _ = proxy.send_event(UserEvent::Device(DeviceEvent::Gone(key.clone())));
-                        present = false;
+                    if let Some(key) = last_key.take() {
+                        let _ = proxy.send_event(UserEvent::Device(DeviceEvent::Gone(key)));
                     }
                 }
             }

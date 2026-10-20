@@ -1,12 +1,12 @@
-//! Razer wireless keyboard battery via the 2.4G dongle (VID 0x1532, PID 0x027B,
-//! "Pro Type Ultra" family — the dongle answers for the paired keyboard).
+//! Razer wireless keyboard battery via 2.4G dongles (VID 0x1532, MI_02 vendor
+//! interface). The dongle answers on behalf of the paired keyboard.
 //!
 //! Protocol (reverse-engineered, matches OpenRazer semantics for the wireless
-//! keyboard transaction): 90-byte feature reports on the MI_02 vendor interface.
+//! keyboard transaction): 90-byte feature reports.
 //!
 //!   payload layout (the 90 bytes, before the report-id prefix):
 //!     [0] status (0x00 for requests)
-//!     [1] transaction id — 0x9F for wireless keyboards
+//!     [1] transaction id — per-dongle, see DONGLES below
 //!     [2..4] remaining packets (0)
 //!     [5] data size
 //!     [6] command class
@@ -38,12 +38,9 @@ use std::ffi::c_void;
 use std::ptr::null_mut;
 
 pub const RAZER_VID: u16 = 0x1532;
-/// 2.4G receiver dongle PID (Pro Type Ultra wireless family).
-pub const RAZER_DONGLE_PID: u16 = 0x027B;
 /// The dongle's vendor command interface (MI_02).
 const VENDOR_IFACE: i32 = 2;
 
-const TRANSACTION_ID: u8 = 0x9F;
 const CMD_CLASS_BATTERY: u8 = 0x07;
 const CMD_GET_BATTERY_LEVEL: u8 = 0x80;
 const CMD_GET_CHARGING_STATUS: u8 = 0x84;
@@ -52,10 +49,65 @@ const STATUS_SUCCESS: u8 = 0x02;
 const RETRIES: usize = 6;
 const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(60);
 
-const DISPLAY_NAME: &str = "Razer Keyboard (2.4G)";
-
 /// Wire size of one feature report: 1 (report id) + 90 (payload).
 const FEATURE_XFER: usize = 91;
+
+/// A supported Razer 2.4G keyboard dongle.
+///
+/// PIDs and transaction IDs follow OpenRazer's `razerkbd_driver` (the wireless
+/// keyboard families use 0x9F; the BlackWidow V3 Pro wired mode 0x3F is listed
+/// only for completeness — dongles are what we scan for). Each dongle answers
+/// for every device paired to it; today's dongles pair a single keyboard.
+struct Dongle {
+    pid: u16,
+    tid: u8,
+    /// What's typically paired to this dongle, for the display name.
+    name: &'static str,
+}
+
+/// Wireless keyboard dongles known to speak this protocol. Extend this table
+/// (from OpenRazer's `razerkbd_driver.h`) to cover new models.
+const DONGLES: &[Dongle] = &[
+    Dongle {
+        pid: 0x027B,
+        tid: 0x9F,
+        name: "Razer Keyboard (2.4G)",
+    }, // Pro Type Ultra (Wireless)
+    Dongle {
+        pid: 0x025C,
+        tid: 0x9F,
+        name: "Razer Keyboard (2.4G)",
+    }, // BlackWidow V3 Pro (Wireless)
+    Dongle {
+        pid: 0x0290,
+        tid: 0x9F,
+        name: "Razer Keyboard (2.4G)",
+    }, // DeathStalker V2 Pro (Wireless)
+    Dongle {
+        pid: 0x0296,
+        tid: 0x9F,
+        name: "Razer Keyboard (2.4G)",
+    }, // DeathStalker V2 Pro TKL (Wireless)
+    Dongle {
+        pid: 0x0271,
+        tid: 0x9F,
+        name: "Razer Keyboard (2.4G)",
+    }, // BlackWidow V3 Mini Hyperspeed (Wireless)
+    Dongle {
+        pid: 0x02BA,
+        tid: 0x9F,
+        name: "Razer Keyboard (2.4G)",
+    }, // BlackWidow V4 Mini Hyperspeed (Wireless)
+    Dongle {
+        pid: 0x02D5,
+        tid: 0x9F,
+        name: "Razer Keyboard (2.4G)",
+    }, // BlackWidow V4 TKL Hyperspeed (Wireless)
+];
+
+fn dongle_for(pid: u16) -> Option<&'static Dongle> {
+    DONGLES.iter().find(|d| d.pid == pid)
+}
 
 // ---------------------------------------------------------------------------
 // Minimal hid.dll / kernel32 FFI
@@ -104,9 +156,10 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// An opened dongle handle with its device path.
+/// An opened dongle handle plus the profile it was matched against.
 pub struct RazerDevice {
     handle: isize,
+    dongle: &'static Dongle,
 }
 
 impl Drop for RazerDevice {
@@ -115,15 +168,26 @@ impl Drop for RazerDevice {
     }
 }
 
-/// Find the dongle's MI_02 path via hidapi enumeration (convenient & reliable).
-pub fn scan_dongle(api: &hidapi::HidApi) -> Option<String> {
-    api.device_list()
-        .find(|info| {
-            info.vendor_id() == RAZER_VID
-                && info.product_id() == RAZER_DONGLE_PID
-                && info.interface_number() == VENDOR_IFACE
-        })
-        .map(|info| info.path().to_string_lossy().into_owned())
+impl RazerDevice {
+    pub fn pid(&self) -> u16 {
+        self.dongle.pid
+    }
+
+    pub fn display_name(&self) -> &'static str {
+        self.dongle.name
+    }
+}
+
+/// Find a supported dongle's MI_02 path via hidapi enumeration. Returns
+/// `(path, profile)`. Multiple Razer dongles at once: only the first is used.
+pub fn scan_dongle(api: &hidapi::HidApi) -> Option<(String, &'static Dongle)> {
+    api.device_list().find_map(|info| {
+        if info.vendor_id() != RAZER_VID || info.interface_number() != VENDOR_IFACE {
+            return None;
+        }
+        let pid = info.product_id();
+        dongle_for(pid).map(|dongle| (info.path().to_string_lossy().into_owned(), dongle))
+    })
 }
 
 /// Open the dongle by device path with plain CreateFileW.
@@ -131,7 +195,7 @@ pub fn scan_dongle(api: &hidapi::HidApi) -> Option<String> {
 /// Access `0` (query-attributes mode) is enough: feature transfers still work
 /// through a 0-access handle, while GENERIC_READ|WRITE gets ACCESS_DENIED (the
 /// dongle exposes a keyboard top-level collection, so Windows locks rw opens).
-pub fn open_dongle(path: &str) -> Result<RazerDevice> {
+pub fn open_dongle(path: &str, dongle: &'static Dongle) -> Result<RazerDevice> {
     let wpath = wide(path);
     let handle = unsafe {
         CreateFileW(
@@ -147,13 +211,13 @@ pub fn open_dongle(path: &str) -> Result<RazerDevice> {
     if handle == INVALID_HANDLE_VALUE {
         bail!("failed to open Razer dongle (access denied)");
     }
-    Ok(RazerDevice { handle })
+    Ok(RazerDevice { handle, dongle })
 }
 
 /// Build a 90-byte request payload.
-fn payload(cmd_class: u8, cmd_id: u8, args: &[u8]) -> [u8; 90] {
+fn payload(tid: u8, cmd_class: u8, cmd_id: u8, args: &[u8]) -> [u8; 90] {
     let mut r = [0u8; 90];
-    r[1] = TRANSACTION_ID;
+    r[1] = tid;
     r[5] = args.len() as u8;
     r[6] = cmd_class;
     r[7] = cmd_id;
@@ -164,8 +228,14 @@ fn payload(cmd_class: u8, cmd_id: u8, args: &[u8]) -> [u8; 90] {
 }
 
 /// Send one command and return the 90-byte response payload.
-fn send_recv(dev: &RazerDevice, cmd_class: u8, cmd_id: u8, args: &[u8]) -> Result<Vec<u8>> {
-    let request = payload(cmd_class, cmd_id, args);
+fn send_recv(
+    dev: &RazerDevice,
+    cmd_class: u8,
+    cmd_id: u8,
+    args: &[u8],
+    tid: u8,
+) -> Result<Vec<u8>> {
+    let request = payload(tid, cmd_class, cmd_id, args);
     for attempt in 0..RETRIES {
         // SET: [0x01 report id] + 90-byte payload = 91 bytes, feature transfer.
         let mut set_buf = [0u8; FEATURE_XFER];
@@ -193,7 +263,7 @@ fn send_recv(dev: &RazerDevice, cmd_class: u8, cmd_id: u8, args: &[u8]) -> Resul
             continue;
         }
         // Response layout: [rid, status, tid, ...] — payload byte 0 is status.
-        if get_buf[1] == STATUS_SUCCESS && get_buf[2] == TRANSACTION_ID {
+        if get_buf[1] == STATUS_SUCCESS && get_buf[2] == tid {
             return Ok(get_buf[1..91].to_vec());
         }
         if attempt + 1 < RETRIES {
@@ -207,14 +277,21 @@ fn send_recv(dev: &RazerDevice, cmd_class: u8, cmd_id: u8, args: &[u8]) -> Resul
 
 /// Read battery percent (0-100) and charging flag from the dongle.
 pub fn read_battery(dev: &RazerDevice) -> Result<(u8, bool)> {
+    let tid = dev.dongle.tid;
     // Response payload: args start at index 8, so args[1] is payload index 9.
     // Battery level: 0-255 there.
-    let resp = send_recv(dev, CMD_CLASS_BATTERY, CMD_GET_BATTERY_LEVEL, &[0, 0])?;
+    let resp = send_recv(dev, CMD_CLASS_BATTERY, CMD_GET_BATTERY_LEVEL, &[0, 0], tid)?;
     let raw = resp[9];
     let percent = ((u32::from(raw) * 100 + 127) / 255).min(100) as u8;
 
     // Charging status: args[1] = 1 when charging.
-    let charging = match send_recv(dev, CMD_CLASS_BATTERY, CMD_GET_CHARGING_STATUS, &[0, 0]) {
+    let charging = match send_recv(
+        dev,
+        CMD_CLASS_BATTERY,
+        CMD_GET_CHARGING_STATUS,
+        &[0, 0],
+        tid,
+    ) {
         Ok(resp) => resp[9] != 0,
         Err(_) => false,
     };
@@ -222,37 +299,41 @@ pub fn read_battery(dev: &RazerDevice) -> Result<(u8, bool)> {
     Ok((percent, charging))
 }
 
-/// One-shot battery state for the paired keyboard, or `None` when the dongle
-/// is absent / the keyboard is asleep (no successful round-trip).
+/// One-shot battery state for the paired keyboard, or `None` when no supported
+/// dongle is present / the keyboard is asleep (no successful round-trip).
 pub fn poll_once(api: &hidapi::HidApi) -> Option<BatteryState> {
-    let path = scan_dongle(api)?;
-    let dev = open_dongle(&path).ok()?;
+    let (path, dongle) = scan_dongle(api)?;
+    let dev = open_dongle(&path, dongle).ok()?;
     let (battery_percent, is_charging) = read_battery(&dev).ok()?;
     Some(BatteryState {
-        device_key: format!("{RAZER_DONGLE_PID:04X}:kbd"),
-        display_name: DISPLAY_NAME.to_string(),
-        pid: RAZER_DONGLE_PID,
+        device_key: format!("{:04X}:kbd", dongle.pid),
+        display_name: dongle.name.to_string(),
+        pid: dongle.pid,
         device_index: 1,
         battery_percent,
         is_charging,
     })
 }
 
-/// Verify a path points at our dongle before opening (cheap sanity check).
+/// Verify a path points at a supported dongle before opening (cheap filter).
 pub fn looks_like_dongle(path: &str) -> bool {
-    path.contains(&format!(
-        "VID_{:04X}&PID_{:04X}",
-        RAZER_VID, RAZER_DONGLE_PID
-    )) && path.contains("MI_02")
+    let pid = path
+        .split("&PID_")
+        .nth(1)
+        .and_then(|rest| u16::from_str_radix(rest.get(..4).unwrap_or(""), 16).ok());
+    match pid {
+        Some(pid) => dongle_for(pid).is_some() && path.contains("MI_02"),
+        None => false,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{looks_like_dongle, payload};
+    use super::{dongle_for, looks_like_dongle, payload, DONGLES};
 
     #[test]
     fn payload_layout() {
-        let p = payload(0x07, 0x80, &[0, 0]);
+        let p = payload(0x9F, 0x07, 0x80, &[0, 0]);
         assert_eq!(p.len(), 90);
         assert_eq!(p[1], 0x9F);
         assert_eq!(p[5], 2);
@@ -266,12 +347,33 @@ mod tests {
     }
 
     #[test]
+    fn known_dongles_resolve() {
+        assert_eq!(dongle_for(0x027B).map(|d| d.tid), Some(0x9F));
+        assert_eq!(dongle_for(0x025C).map(|d| d.tid), Some(0x9F));
+        assert!(dongle_for(0x0277).is_none()); // wired keyboard, not a dongle
+    }
+
+    #[test]
+    fn dongle_table_has_unique_pids() {
+        let mut pids: Vec<u16> = DONGLES.iter().map(|d| d.pid).collect();
+        pids.sort_unstable();
+        pids.dedup();
+        assert_eq!(pids.len(), DONGLES.len());
+    }
+
+    #[test]
     fn path_filter() {
         assert!(looks_like_dongle(
             r"\\?\HID#VID_1532&PID_027B&MI_02#7&13cbecd4&0&0000#{4d1e55b2-f16f-11cf-88cb-001111000030}"
         ));
+        assert!(looks_like_dongle(
+            r"\\?\HID#VID_1532&PID_025C&MI_02#7&13cbecd4&0&0000#{4d1e55b2-f16f-11cf-88cb-001111000030}"
+        ));
         assert!(!looks_like_dongle(
             r"\\?\HID#VID_1532&PID_027B&MI_00#7&13cbecd4&0&0000#{4d1e55b2-f16f-11cf-88cb-001111000030}"
+        ));
+        assert!(!looks_like_dongle(
+            r"\\?\HID#VID_1532&PID_0277&MI_02#7&13cbecd4&0&0000#{4d1e55b2-f16f-11cf-88cb-001111000030}"
         ));
     }
 }
