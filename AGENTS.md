@@ -27,9 +27,13 @@ Windows-only Rust 托盘应用：通过 HID++ 2.0 协议读取罗技无线鼠标
 - 测试全部为各模块内 `#[cfg(test)]` 单元测试（`cargo test --all-targets`），多数不依赖硬件。
 - 真实硬件行为（HID++ 通信、通知推送）无法用单测覆盖，用 `--once`/`--diag` 配合真实 LIGHTSPEED/Bolt/Unifying 接收器验证。
 
+## 提交约定
+
+- **commit message 一律用中文**：格式 `类型: 中文摘要`（`feat:` / `fix:` / `docs:` / `chore:` / `ci:` / `refactor:`），正文用中文详述动机与改动点。上游合入的英文 commit 保持原样，不追溯改写。
+
 ## 雷蛇模块注意事项（`src/hid/razer.rs`）
 
-- dongle：`VID_1532 PID_027B MI_02`，90 字节 feature report，tid `0x9F`，CRC = bytes 2..=87 XOR。
+- dongle：`VID_1532 MI_02`，90 字节 feature report，CRC = bytes 2..=87 XOR；支持型号见模块内 `DONGLES` 表（Pro Type Ultra 0x027B、BlackWidow V3/V4 Pro、DeathStalker V2 Pro 等，tid 均为 0x9F）。新模型往表里加一行即可。
 - **必须用 raw FFI**（CreateFileW + HidD_SetFeature/GetFeature）：该接口 HIDP_CAPS 的 `FeatureReportByteLength=0`，hidapi windows-native 后端按 caps 定长缓冲会全部空回。
 - 打开句柄用 **access=0**（rw 打开会 ACCESS_DENIED，因为设备含键盘顶层集合）；feature 传输在 0-access 句柄上仍然有效。
 - 传输长度 91 字节（1 rid + 90 payload）；SET 前缀 rid 0x01。
