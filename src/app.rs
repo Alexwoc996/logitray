@@ -1,6 +1,7 @@
 use crate::config;
 use crate::hid::client;
 use anyhow::{Context, Result};
+use hidapi::HidApi;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -27,6 +28,24 @@ pub fn run_once() -> Result<()> {
                 if dev.is_charging { "% (charging)" } else { "%" }
             );
         }
+    }
+
+    // Razer keyboard (2.4G dongle), reported alongside the Logitech devices.
+    match HidApi::new() {
+        Ok(api) => match crate::hid::razer::poll_once(&api) {
+            Some(state) => println!(
+                "{} — {}{}",
+                state.display_name,
+                state.battery_percent,
+                if state.is_charging {
+                    "% (charging)"
+                } else {
+                    "%"
+                }
+            ),
+            None => println!("No Razer dongle found (or keyboard asleep)."),
+        },
+        Err(err) => eprintln!("Razer: failed to initialize hidapi: {err}"),
     }
 
     if !result.errors.is_empty() {

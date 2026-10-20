@@ -436,6 +436,11 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
         },
     );
 
+    // Razer dongle thread: shares the same command channel (Refresh/Exit) and
+    // emits the same DeviceEvent updates as the Logitech workers.
+    let (razer_tx, razer_rx) = mpsc::channel::<WorkerCommand>();
+    spawn_razer_worker(proxy.clone(), razer_rx);
+
     let mut text_mode = cfg.text_mode();
     let mut available_update: Option<Version> = None;
     let mut menu = MenuHandles::build(&cfg, autostart_enabled, text_mode)?;
@@ -483,8 +488,10 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
                 UserEvent::Menu(id) => {
                     if id == "refresh" {
                         let _ = cmd_tx.send(WorkerCommand::Refresh);
+                        let _ = razer_tx.send(WorkerCommand::Refresh);
                     } else if id == "exit" {
                         let _ = cmd_tx.send(WorkerCommand::Exit);
+                        let _ = razer_tx.send(WorkerCommand::Exit);
                         *control_flow = ControlFlow::Exit;
                     } else if id == "autostart" {
                         // muda auto-toggles the check state before firing this
@@ -912,6 +919,58 @@ fn sorted_devices(map: &BTreeMap<String, BatteryState>) -> Vec<BatteryState> {
 /// existing receivers keep running independently; this only governs detecting a
 /// receiver that was just plugged in (rare), so it can be relaxed.
 const RESCAN_SECS: u64 = 20;
+
+/// How often the Razer dongle thread re-reads battery. Razer's dongle protocol
+/// has no push notifications (unlike HID++), so this is a plain poll. The
+/// keyboard's charge changes very slowly; a couple of minutes is plenty.
+const RAZER_POLL_SECS: u64 = 120;
+
+/// Poll the Razer dongle forever and feed updates into the tray's event loop.
+/// Keeps the same `DeviceEvent` stream the Logitech workers use, so the menu,
+/// icon, and low-battery notifier all treat it like any other device.
+fn spawn_razer_worker(proxy: EventLoopProxy<UserEvent>, cmd_rx: mpsc::Receiver<WorkerCommand>) {
+    thread::spawn(move || {
+        let key = format!("{:04X}:kbd", crate::hid::razer::RAZER_DONGLE_PID);
+        let mut present = false;
+        loop {
+            // Poll first: the very first iteration runs immediately, so the
+            // keyboard shows up right after startup instead of one full
+            // interval later.
+            let api = match HidApi::new() {
+                Ok(api) => api,
+                Err(err) => {
+                    tracing::warn!("razer: hidapi init failed: {err}");
+                    thread::sleep(Duration::from_secs(RAZER_POLL_SECS));
+                    continue;
+                }
+            };
+            match crate::hid::razer::poll_once(&api) {
+                Some(state) => {
+                    let _ = proxy.send_event(UserEvent::Device(DeviceEvent::Update(state)));
+                    present = true;
+                }
+                None => {
+                    // Dongle unplugged or keyboard asleep/asleep-fail. Only emit
+                    // Gone once per disappearance so the menu doesn't flicker.
+                    if present {
+                        let _ = proxy.send_event(UserEvent::Device(DeviceEvent::Gone(key.clone())));
+                        present = false;
+                    }
+                }
+            }
+
+            // Then wait out the interval while still servicing commands.
+            match cmd_rx.recv_timeout(Duration::from_secs(RAZER_POLL_SECS)) {
+                Ok(WorkerCommand::Exit) => return,
+                // Refresh: loop around for an immediate re-poll.
+                Ok(WorkerCommand::Refresh) => {}
+                Ok(WorkerCommand::SetSafetyInterval(_)) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+        }
+    });
+}
 
 /// Supervise the per-receiver workers: spawn one for each receiver as it appears,
 /// prune workers whose receiver vanished, and fan out UI commands to all of them.
