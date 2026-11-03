@@ -135,12 +135,28 @@ pub fn log_path() -> PathBuf {
     app_data_dir().join(format!("{APP_ID}.log"))
 }
 
+/// Where the battery snapshot for other programs is written.
+///
+/// The TrafficMonitor plugin reads this instead of re-implementing the HID++
+/// and Razer dongle protocols. Keep the name in sync with that plugin.
+pub fn battery_snapshot_path() -> PathBuf {
+    app_data_dir().join("battery.txt")
+}
+
 /// Makes each in-flight temp file name unique within the process.
 static TMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Serializes the read-modify-write in [`save_device_profile`] across receiver
 /// worker threads.
 static PROFILE_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Write `raw` to `path` atomically (temp file + rename).
+///
+/// Public so callers outside this module (the battery snapshot in `tray`) get
+/// the same crash-safe write the config uses.
+pub fn write_file_atomic(path: &Path, raw: &[u8]) -> Result<()> {
+    write_atomic(path, raw)
+}
 
 fn write_atomic(path: &Path, raw: &[u8]) -> Result<()> {
     let parent = path

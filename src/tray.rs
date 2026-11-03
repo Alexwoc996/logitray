@@ -666,6 +666,13 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
 
                     devices = sorted_devices(&device_map);
 
+                    // Publish a snapshot for external consumers (the
+                    // TrafficMonitor plugin). Best-effort: a failure here must
+                    // never break the tray.
+                    if let Err(err) = write_battery_snapshot(&devices) {
+                        tracing::debug!("failed writing battery snapshot: {err}");
+                    }
+
                     if adopt_initial_device(&mut selected_id, &devices) {
                         cfg.selected_device_id = selected_id.clone();
                         if let Err(err) = config::save_config(&cfg) {
@@ -723,6 +730,43 @@ fn build_tray_icon(menu: &Menu, icon: Icon) -> Result<TrayIcon> {
         .with_icon(icon)
         .build()
         .context("failed creating tray icon")
+}
+
+/// Write the current device batteries to `%APPDATA%\logitray\battery.txt`.
+///
+/// External tools (the TrafficMonitor plugin) read this file instead of
+/// re-implementing the HID++ and Razer dongle protocols. Format is one device
+/// per line, tab-separated, with a header:
+///
+/// ```text
+/// # logitray battery snapshot
+/// # name<TAB>percent<TAB>charging
+/// G502 X LIGHTSPEED<TAB>95<TAB>0
+/// Razer Keyboard (2.4G)<TAB>95<TAB>1
+/// ```
+///
+/// Written atomically so a reader never sees a half-written file. The trailing
+/// newline keeps line-based readers happy.
+fn write_battery_snapshot(devices: &[BatteryState]) -> anyhow::Result<()> {
+    config::write_file_atomic(
+        &config::battery_snapshot_path(),
+        battery_snapshot_text(devices).as_bytes(),
+    )
+}
+
+/// Render the snapshot text. Split from the write so the format is unit-testable.
+fn battery_snapshot_text(devices: &[BatteryState]) -> String {
+    let mut out = String::from("# logitray battery snapshot\n# name\tpercent\tcharging\n");
+    for device in devices {
+        // Tabs and newlines would break the line-per-device format.
+        let name = device.display_name.replace(['\t', '\n', '\r'], " ");
+        out.push_str(&format!(
+            "{name}\t{}\t{}\n",
+            device.battery_percent,
+            u8::from(device.is_charging)
+        ));
+    }
+    out
 }
 
 fn refresh_tray_visuals(
@@ -1096,6 +1140,40 @@ mod tests {
             battery_percent: 80,
             is_charging: false,
         }
+    }
+
+    /// The snapshot is a cross-process contract: the TrafficMonitor plugin
+    /// parses it. Pin the exact format so a refactor here cannot silently
+    /// break that reader.
+    #[test]
+    fn snapshot_format_is_stable() {
+        let mut mouse = mk("a");
+        mouse.display_name = "G502 X LIGHTSPEED".to_string();
+        mouse.battery_percent = 95;
+        let mut keyboard = mk("b");
+        keyboard.display_name = "Razer Keyboard (2.4G)".to_string();
+        keyboard.battery_percent = 88;
+        keyboard.is_charging = true;
+
+        let text = super::battery_snapshot_text(&[mouse, keyboard]);
+        assert_eq!(
+            text,
+            "# logitray battery snapshot\n\
+             # name\tpercent\tcharging\n\
+             G502 X LIGHTSPEED\t95\t0\n\
+             Razer Keyboard (2.4G)\t88\t1\n"
+        );
+    }
+
+    /// A device name is free-form; a tab would split the row into extra
+    /// columns and a newline would invent a device.
+    #[test]
+    fn snapshot_sanitizes_separators_in_names() {
+        let mut device = mk("a");
+        device.display_name = "Weird\tName\nX".to_string();
+        let text = super::battery_snapshot_text(&[device]);
+        let row = text.lines().nth(2).unwrap();
+        assert_eq!(row, "Weird Name X\t80\t0");
     }
 
     #[test]
